@@ -29,6 +29,7 @@ ENV/
 .idea/
 .DS_Store
 Thumbs.db
+.claude/
 
 # Build / dist
 build/

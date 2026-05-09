@@ -86,8 +86,26 @@ class OpenRouterClient:
                     time.sleep(wait)
                     continue
                 if r.status_code != 200:
+                    # Some providers (e.g. Opus via Bedrock) reject the
+                    # assistant-prefill trick. Retry once without prefill
+                    # before giving up — response_format=json_object is
+                    # usually enough on its own.
+                    body = r.text or ""
+                    if (
+                        prefill
+                        and r.status_code == 400
+                        and "assistant message prefill" in body
+                    ):
+                        log.warning(
+                            "Provider rejected prefill for %s; retrying without it",
+                            model,
+                        )
+                        prefill = ""
+                        effective = list(messages)
+                        payload["messages"] = effective
+                        continue
                     raise OpenRouterError(
-                        f"OpenRouter {r.status_code}: {r.text[:300]}"
+                        f"OpenRouter {r.status_code}: {body[:300]}"
                     )
                 data = r.json()
                 self._tally(model, data.get("usage", {}))

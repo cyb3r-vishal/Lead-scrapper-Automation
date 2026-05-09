@@ -80,6 +80,10 @@ BEHAVIORAL RULES:
 - "finish" only when target_count is reached or no further progress is possible.
 - NEVER fabricate leads. Only extract what is clearly on the page.
 - Keep phone numbers with country/area codes when shown.
+- If state.current_page_exhausted is true OR last_result says the current URL
+  is EXHAUSTED / added 0 new, the next action MUST be "search" or "visit" to
+  a URL NOT already in recent_urls. Do NOT emit "scroll" or "extract" on an
+  exhausted page — it will just repeat duplicates.
 """
 
 
@@ -98,6 +102,10 @@ class Agent:
         self.recent_queries: deque[str] = deque(maxlen=RECENT_MEMORY)
         self.recent_urls: deque[str] = deque(maxlen=RECENT_MEMORY)
         self.tried_source_hints: set[str] = set()
+        # Per-URL count of consecutive extracts that produced 0 new leads.
+        # Lets us detect "this page is fully scraped / already in the file"
+        # and force the agent to navigate away instead of re-extracting.
+        self.url_stall_counts: dict[str, int] = {}
 
     # ---- public API --------------------------------------------------------
 
@@ -130,14 +138,35 @@ class Agent:
 
                 if no_progress_streak >= config.NO_PROGRESS_STEPS_BEFORE_RECOVERY:
                     self._plan_ref = self._recover(task, self._plan_ref)
-                    last_result = (
-                        "Strategy reset. New seed queries: "
-                        + json.dumps(self._plan_ref.get("seed_queries", []))
-                    )
-                    no_progress_streak = 0
+                    # After reset, force a deterministic navigation so we don't
+                    # re-extract the stuck page. The AI otherwise tends to
+                    # repeat the same extract on the same DOM.
+                    action = self._fallback_action(self._plan_ref)
+                    log.info("post-recovery forced action: %s",
+                             json.dumps(action, ensure_ascii=False)[:200])
+                    last_action = action
+                    try:
+                        last_result, progressed = self._execute(action)
+                    except Exception as e:
+                        log.exception("post-recovery action failed: %s", e)
+                        last_result = f"Action error: {e}"
+                        progressed = False
+                    no_progress_streak = 0 if progressed else no_progress_streak + 1
+                    if action.get("action") == "finish":
+                        log.info("fallback exhausted after recovery: %s",
+                                 action.get("reason"))
+                        break
                     continue
 
-                action = self._step(task, count, self._plan_ref, last_action, last_result)
+                # If the current URL is already known-exhausted, don't waste
+                # an AI call — just navigate away deterministically.
+                cur_url = self.browser.current_url()
+                if self.url_stall_counts.get(cur_url, 0) >= 2:
+                    log.info("URL is exhausted (%d stalls); forcing fallback",
+                             self.url_stall_counts[cur_url])
+                    action = self._fallback_action(self._plan_ref)
+                else:
+                    action = self._step(task, count, self._plan_ref, last_action, last_result)
                 last_action = action
 
                 try:
@@ -202,6 +231,13 @@ class Agent:
         try:
             new_plan = self.ai.plan(messages, max_tokens=800)
             new_plan.setdefault("columns", prior.get("columns"))
+            # Preserve prior hints if Opus omits them — _fallback_action needs
+            # them to navigate away when the AI gets stuck again.
+            prior_hints = prior.get("source_hints") or []
+            new_hints = new_plan.get("source_hints") or []
+            merged = list(dict.fromkeys([*new_hints, *prior_hints]))
+            if merged:
+                new_plan["source_hints"] = merged
             return new_plan
         except OpenRouterError as e:
             log.warning("recovery planner failed (%s); keeping prior plan", e)
@@ -218,6 +254,8 @@ class Agent:
         last_result: str,
     ) -> dict[str, Any]:
         hints = plan.get("source_hints") or []
+        current_url = self.browser.current_url()
+        stalls_here = self.url_stall_counts.get(current_url, 0)
         state = {
             "task": task,
             "target_count": count,
@@ -226,11 +264,14 @@ class Agent:
             "seed_queries": plan.get("seed_queries"),
             "source_hints": hints,
             "untried_source_hints": [h for h in hints if h not in self.tried_source_hints],
-            "current_url": self.browser.current_url(),
+            "current_url": current_url,
             "page_title": self.browser.title(),
             "blocked": self.browser.is_blocked(),
             "recent_queries": list(self.recent_queries),
             "recent_urls": list(self.recent_urls),
+            "current_page_stalls": stalls_here,
+            "current_page_exhausted": stalls_here >= 1,
+            "exhausted_urls": [u for u, n in self.url_stall_counts.items() if n >= 2],
             "last_action": last_action,
             "last_result": last_result,
         }
@@ -310,20 +351,36 @@ class Agent:
 
         if a == "scroll":
             self.browser.scroll(action.get("amount", "page"))
-            return "Scrolled.", True
+            # Scrolling alone isn't progress — only actual new leads count.
+            # Otherwise extract/scroll loops on a stuck page reset the
+            # no-progress streak forever and recovery never fires.
+            return "Scrolled.", False
 
         if a == "back":
             self.browser.back()
-            return "Went back.", True
+            return "Went back.", False
 
         if a == "extract":
             leads = action.get("leads") or []
             added = self._ingest(leads)
-            return (
-                f"Extracted {len(leads)} candidate rows, added {added} new "
-                f"(total {self.leads_collected}).",
-                added > 0,
-            )
+            url = self.browser.current_url()
+            if added == 0:
+                self.url_stall_counts[url] = self.url_stall_counts.get(url, 0) + 1
+                msg = (
+                    f"Extracted {len(leads)} rows but added 0 NEW leads "
+                    f"(all duplicates — already in the output file). "
+                    f"URL {url!r} is EXHAUSTED (stall #{self.url_stall_counts[url]}). "
+                    "You MUST navigate away now: emit 'visit' with a NEW url "
+                    "(not in recent_urls) or 'search' with a fresh query. "
+                    "Do NOT 'scroll' or 'extract' on this page again."
+                )
+            else:
+                self.url_stall_counts[url] = 0
+                msg = (
+                    f"Extracted {len(leads)} candidate rows, added {added} new "
+                    f"(total {self.leads_collected})."
+                )
+            return msg, added > 0
 
         if a == "finish":
             return f"Finished: {action.get('reason','')}", False
